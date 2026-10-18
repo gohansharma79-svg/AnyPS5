@@ -8557,6 +8557,58 @@ void ResourceContentKeyTests(bool benchmark) {
 // into a second device) rebuilds the recorded graphics pipeline so the same configuration hits the
 // store, hands the compute result to its hook, recovers a tail torn inside a record's padding and
 // stops when cancelled.
+void pipelinePreviousKeyTests(bool benchmark) {
+    using namespace AgcDriver::Graphics;
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.device = makeHandle<VkDevice>();
+    context.graphicsPipelineLibrary = true;
+    context.pipelineLinkTimeOptimization = false;
+    context.limits.framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    ShaderRecompiler::RecompileResult vertex, fragment;
+    vertex.spirv = makeModule({});
+    fragment.spirv = makeModule({.fragment = true});
+    vertex.variantId = 1201;
+    fragment.variantId = 1202;
+    const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, PipelinePushSlotBytes}}};
+    std::array<std::uint32_t, 1> mainKey{131}, fragmentKey{132};
+    const PipelineSetLayouts resources{makeHandle<VkDescriptorSetLayout>(), makeHandle<VkDescriptorSetLayout>(), true, mainKey, fragmentKey};
+    State firstState{};
+    State otherState{};
+    otherState.cullMode = VK_CULL_MODE_BACK_BIT;
+    auto first = CachedPipeline(context, firstState, VertexInputLayout{}, resources, shaders);
+    const auto initial = mock.pipelineCreateCount;
+    for (int i = 0; i < 100; ++i) Require(CachedPipeline(context, firstState, VertexInputLayout{}, resources, shaders) == first, "repeated key returned another pipeline");
+    Require(mock.pipelineCreateCount == initial, "repeated keys created a pipeline");
+    if (benchmark) {
+        constexpr std::size_t count = 1000000;
+        const auto begin = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < count; ++i) Require(CachedPipeline(context, firstState, VertexInputLayout{}, resources, shaders) == first, "benchmark pipeline changed");
+        const auto elapsed = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - begin).count();
+        std::cout << "pipeline lookup us/call=" << elapsed / count << " count=" << count << '\n';
+    }
+    auto other = CachedPipeline(context, otherState, VertexInputLayout{}, resources, shaders);
+    Require(other != first, "a changed pipeline state reused the previous pipeline");
+    Require(CachedPipeline(context, firstState, VertexInputLayout{}, resources, shaders) == first, "a non-consecutive key missed its resident pipeline");
+    ClearCachedPipelines(context.device);
+    auto recreated = CachedPipeline(context, firstState, VertexInputLayout{}, resources, shaders);
+    Require(recreated != first, "clearing the store left a previous pipeline resident");
+    first.reset();
+    other.reset();
+    ClearCachedPipelines(context.device);
+    recreated.reset();
+    auto victim = CachedPipeline(context, firstState, VertexInputLayout{}, resources, shaders);
+    victim.reset();
+    std::thread replace([&] { static_cast<void>(CachedPipeline(context, otherState, VertexInputLayout{}, resources, shaders)); });
+    replace.join();
+    const auto beforeReturn = mock.pipelineCreateCount;
+    auto returned = CachedPipeline(context, firstState, VertexInputLayout{}, resources, shaders);
+    Require(mock.pipelineCreateCount > beforeReturn, "another thread did not evict the previous key at the one-entry bound");
+    ClearCachedPipelines(context.device);
+    returned.reset();
+    Require(mock.live == 0, "previous pipeline tests leaked Vulkan objects");
+}
+
 void pipelineStoreLazyBufferPoolTests() {
     using namespace AgcDriver::Graphics;
     mock = MockVulkan{};
@@ -8890,6 +8942,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-library-clear-waits-for-build") {
             pipelineLibraryClearWaitsForBuildTests();
             std::cout << "pipeline library clear waits for active part builds\n";
+            return 0;
+        }
+        if (argc == 2 && (std::string_view(argv[1]) == "--pipeline-previous-key" || std::string_view(argv[1]) == "--pipeline-previous-key-benchmark")) {
+            pipelinePreviousKeyTests(std::string_view(argv[1]) == "--pipeline-previous-key-benchmark");
+            std::cout << "previous pipeline invalidation tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-store-lazy-buffer-pool") {

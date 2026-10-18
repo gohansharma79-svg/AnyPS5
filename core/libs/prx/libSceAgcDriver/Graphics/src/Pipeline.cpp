@@ -934,9 +934,20 @@ struct PipelineStore {
     std::uint64_t misses = 0;
     std::uint64_t uncached = 0;
     std::uint64_t evicted = 0;
+    std::uint64_t generation = 1;
     PipelineStoreCounters totals;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
+
+struct PreviousPipeline {
+    std::list<PipelineStore::Entry>::iterator entry;
+    std::uint64_t generation = 0;
+};
+
+PreviousPipeline& PreviousPipelineOfThread() {
+    struct PreviousPipelineStorage {};
+    return HostThreadLocal<PreviousPipeline, PreviousPipelineStorage>();
+}
 
 // Never destroyed: the pipelines belong to a device that may already be gone when statics die, and
 // the device's teardown (ClearCachedPipelines) is the place to destroy them.
@@ -960,6 +971,7 @@ bool alive(PipelineStore::Entry& entry, const Context& context) {
 // not destroyed.
 std::list<PipelineStore::Entry>::iterator abandon(PipelineStore& store, std::list<PipelineStore::Entry>::iterator it) {
     it->pipeline->Abandon();
+    ++store.generation;
     store.index.erase(it->hash);
     return store.entries.erase(it);
 }
@@ -1000,7 +1012,14 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         ++store.totals.uncached;
         return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     }
-    const auto hash = hashKey(key);
+    static const bool previousEnabled = std::getenv("APS5_NO_PIPELINE_PREVIOUS_KEY") == nullptr;
+    auto* previous = previousEnabled ? &PreviousPipelineOfThread() : nullptr;
+    const auto remember = [&](std::list<PipelineStore::Entry>::iterator entry) {
+        if (previous == nullptr) return;
+        previous->entry = entry;
+        previous->generation = store.generation;
+    };
+    std::uint64_t hash = 0;
     // The store's entry of the key, or nullptr with `found` telling a miss (the key is new) from a
     // collision (another configuration owns the hash, so this one stays private).
     const auto lookup = [&](bool& collision) -> std::shared_ptr<Pipeline> {
@@ -1024,10 +1043,19 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     {
         std::lock_guard lock(store.mutex);
         reportPipelines(store);
+        if (previous != nullptr && previous->generation != 0 && previous->generation == store.generation && previous->entry->key == key && alive(*previous->entry, context)) {
+            ++store.hits;
+            ++store.totals.hits;
+            store.entries.splice(store.entries.end(), store.entries, previous->entry);
+            return previous->entry->pipeline;
+        }
+        if (previous != nullptr) previous->generation = 0;
+        hash = hashKey(key);
         bool collision = false;
         if (auto pipeline = lookup(collision)) {
             ++store.hits;
             ++store.totals.hits;
+            remember(store.index.find(hash)->second);
             return pipeline;
         }
         if (collision) {
@@ -1048,7 +1076,10 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     {
         std::lock_guard lock(store.mutex);
         bool collision = false;
-        if (auto raced = lookup(collision)) return raced;
+        if (auto raced = lookup(collision)) {
+            remember(store.index.find(hash)->second);
+            return raced;
+        }
         if (collision) {
             ++store.uncached;
             ++store.totals.uncached;
@@ -1075,9 +1106,11 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
             if (victim == store.entries.end()) break;
             store.index.erase(victim->hash);
             store.entries.erase(victim);
+            ++store.generation;
             ++store.evicted;
             ++store.totals.evicted;
         }
+        if (const auto held = store.index.find(hash); held != store.index.end() && held->second->pipeline == pipeline) remember(held->second);
     }
     if (created != nullptr) *created = true;
     if (PipelineJournalEnabled() && !PipelineJournalReplaying()) RecordGraphicsPipeline(MakeGraphicsPipelineRecipe(state, vertexInput, resources, shaders, attachmentLayout), shaders);
@@ -1107,6 +1140,7 @@ void ClearCachedPipelines(VkDevice device) {
         }
         store.index.erase(it->hash);
         it = store.entries.erase(it);
+        ++store.generation;
     }
     ClearPipelineLibraries(device);
 }
